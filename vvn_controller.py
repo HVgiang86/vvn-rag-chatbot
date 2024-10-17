@@ -64,31 +64,13 @@ def retrieve_relevant_documents(query, text_chunk_vectors, k):
     top_k_indices = np.argsort(similarities)[::-1][:k]
     return reviews_df.iloc[top_k_indices]
 
-prompt_template = """
-Bạn là một trợ lý trò chuyện hữu ích tên là MaiDora. Tôi sẽ cung cấp cho bạn một số đánh giá sản phẩm trên một nền tảng thương mại điện tử về một sản phẩm cụ thể.
-Tôi muốn bạn xem xét các ý kiến khác nhau trong thông tin mà tôi cung cấp và tạo ra một câu trả lời ngắn gọn, chính xác và đủ thông tin bằng tiếng Việt cho câu hỏi của người dùng.
-Đừng trả lời nếu bạn không biết câu trả lời, đừng tự nghĩ ra câu trả lời.
-Nếu bạn muốn đề xuất một sản phẩm, vui lòng viết id sản phẩm và tên của sản phẩm dưới dạng: {{id sản phẩm}}[Tên sản phẩm], ví dụ {{26}}[Áo dài].
+def load_template(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        return file.read()
 
-Dưới đây là các tài liệu:
-<documents>
+prompt_template = load_template('prompt_template.txt')
 
-Câu hỏi của người dùng: <query>
-"""
-
-continue_prompt_template = """
-Bạn là một trợ lý trò chuyện hữu ích tên là MaiDora. Tôi sẽ cung cấp cho bạn một số đánh giá sản phẩm trên một nền tảng thương mại điện tử về một sản phẩm cụ thể.
-Tôi muốn bạn xem xét các ý kiến khác nhau trong thông tin mà tôi cung cấp và tạo ra một câu trả lời ngắn gọn, chính xác và đủ thông tin bằng tiếng Việt cho câu hỏi của người dùng.
-Đừng trả lời nếu bạn không biết câu trả lời, đừng tự nghĩ ra câu trả lời.
-Nếu bạn muốn đề xuất một sản phẩm, vui lòng viết id sản phẩm và tên của sản phẩm dưới dạng: {{id sản phẩm}}[Tên sản phẩm], ví dụ {{26}}[Áo dài].
-
-Dưới đây là các tài liệu:
-<documents>
-
-Những trao đổi trước đó của bạn và người dùng: <old_query>
-Câu hỏi hiện tại của người dùng: <query>
-"""
-
+continue_prompt_template = load_template("continue_prompt_template.txt")
 
 def create_prompt(query, k=5):
     relevant_rows = retrieve_relevant_documents(query, text_chunk_vectors, k)
