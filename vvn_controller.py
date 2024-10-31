@@ -1,15 +1,34 @@
 # rag_handler.py
-import pandas as pd
 from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+from langchain_community.vectorstores import FAISS
 import google.generativeai as genai
 from dotenv import load_dotenv
 import os
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.chains import create_history_aware_retriever
+from langchain_core.prompts import MessagesPlaceholder
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+import pandas as pd
 
 load_dotenv()
+
 Gemini_Api_key = os.getenv("GEMINI_API_KEY")
+
+if "GOOGLE_API_KEY" not in os.environ:
+    os.environ["GOOGLE_API_KEY"] = Gemini_Api_key
+
+genai.configure(api_key=Gemini_Api_key)
+llm = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",
+    temperature=0.2,
+    max_tokens=250,
+    max_retries=2,
+)
 
 # Load and preprocess data
 review_df = pd.read_csv("vvn_data.csv")
@@ -20,6 +39,11 @@ if 'ID' not in review_df.columns:
 grouped_reviews_df = review_df.groupby('ID')
 group_list = [group for _, group in grouped_reviews_df]
 reviews_df = pd.concat(group_list)
+
+def load_prompt_template(file_path='prompt_template.txt'):
+    with open(file_path, 'r') as file:
+        return file.read()
+
 
 def text_concat_info(row):
     _id = row["ID"]
@@ -38,8 +62,8 @@ reviews_df = reviews_df.drop_duplicates(subset=["Result Text"])
 
 text_splitter = RecursiveCharacterTextSplitter(
     separators=["."],
-    chunk_size=400,
-    chunk_overlap=0,
+    chunk_size=1000,
+    chunk_overlap=200,
     is_separator_regex=False,
 )
 
@@ -56,70 +80,84 @@ model_name = "all-mpnet-base-v2"
 model = SentenceTransformer(model_name)
 
 text_chunks = reviews_df["text_chunk"].tolist()
-text_chunk_vectors = model.encode(text_chunks, show_progress_bar=True)
+db = FAISS.from_texts(text_chunks, HuggingFaceEmbeddings(model_name='sentence-transformers/all-mpnet-base-v2'))
 
-def retrieve_relevant_documents(query, text_chunk_vectors, k):
-    query_embedding = model.encode(query)
-    similarities = cosine_similarity([query_embedding], text_chunk_vectors)[0]
-    top_k_indices = np.argsort(similarities)[::-1][:k]
-    return reviews_df.iloc[top_k_indices]
+# Connect query to FAISS index using a retriever
+retriever = db.as_retriever(
+    search_type="similarity",
+    search_kwargs={'k': 10}
+)
 
-def load_template(file_path):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        return file.read()
+prompt_template = load_prompt_template('langchain_prompt.txt')
 
-prompt_template = load_template('prompt_template.txt')
+chat_history = []
 
-continue_prompt_template = load_template("continue_prompt_template.txt")
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", prompt_template),
+        ("human", "{input}"),
+    ]
+)
 
-def create_prompt(query, k=5):
-    relevant_rows = retrieve_relevant_documents(query, text_chunk_vectors, k)
-    text_chunks = relevant_rows["text_chunk"].tolist()
-    text_chunks_string = "\n".join(text_chunks)
-    prompt = prompt_template
-    prompt = prompt.replace("<documents>", text_chunks_string)
-    prompt = prompt.replace("<query>", query)
-    return prompt
+qa_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", prompt_template),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ]
+)
 
-def create_continue_prompt(query_history, query, k=5):
-    relevant_rows = retrieve_relevant_documents(query, text_chunk_vectors, k)
-    text_chunks = relevant_rows["text_chunk"].tolist()
-    text_chunks_string = "\n".join(text_chunks)
-    prompt = continue_prompt_template
-    prompt = prompt.replace("<documents>", text_chunks_string)
-    prompt = prompt.replace("<query>", query)
-    query_history_str = "\n".join(query_history)
-    print("Chat history: ", query_history_str)
-    prompt = prompt.replace("<old_query>", query_history_str)
-    return prompt
+contextualize_q_system_prompt = (
+    """Given a chat history between an AI chatbot and user
+    that chatbot's message marked with [bot] prefix and user's message marked with [user] prefix,
+    and given the latest user question.
+    which might reference context in the chat history, 
+    formulate a standalone question which can be understood 
+    without the chat history. Do NOT answer the question, 
+    just reformulate it if needed and otherwise return it as is. Write it in Vietnamese."""
+)
 
-genai.configure(api_key=Gemini_Api_key)
-geminiModel = genai.GenerativeModel('gemini-1.5-flash')
+contextualize_q_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ]
+)
 
-def generate(prompt):
-    response = geminiModel.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(
-            max_output_tokens=256,
-            temperature=0.2
-        )
-    )
-    return response.text
+history_aware_retriever = create_history_aware_retriever(
+    llm, retriever, contextualize_q_prompt
+)
 
-def send_new_chat(query):
-    prompt = create_prompt(query)
-    return generate(prompt)
+question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+
+rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+question = "Tôi nặng 65kg, muốn tìm một chiếc áo thể thao"
+
+ai_msg_1 = rag_chain.invoke({"input": question, "chat_history": chat_history})
+print(ai_msg_1["answer"])
+
+chat_history.extend(
+    [
+        HumanMessage(content=question),
+        AIMessage(content=ai_msg_1["answer"]),
+    ]
+)
+
+second_question = "Những sản phẩm này làm từ chất liệu gì?"
+ai_msg_2 = rag_chain.invoke({"input": second_question, "chat_history": chat_history})
+print(ai_msg_2["answer"])
 
 def send_continue_chat(chat_history, query):
     history = []
 
     for chat in chat_history:
         chat_query = chat.content
-
         if chat.is_user:
-            history.append("người dùng:" + chat_query)
+            history.append("[bot] " + str(chat_query))
         else:
-            history.append("bạn:" + chat_query)
+            history.append("[user] " + str(chat_query))
 
-    prompt = create_continue_prompt(history, query)
-    return generate(prompt)
+    response = rag_chain.invoke({"input": query, "chat_history": history})
+    return response["answer"]
